@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Particle Blessing System</title>
+    <!-- 引入 MediaPipe 官方 CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <!-- 引入 Three.js 官方 CDN -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; font-family: "Microsoft YaHei", sans-serif; }
+        #container { position: relative; width: 100vw; height: 100vh; }
+        
+        #input_video {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transform: scaleX(-1); 
+            opacity: 0.3; 
+            z-index: 1;
+        }
+
+        #canvas_output {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: 10;
+            pointer-events: none;
+        }
+
+        .hint {
+            position: fixed;
+            bottom: 20px;
+            width: 100%;
+            text-align: center;
+            color: rgba(255,255,255,0.8);
+            font-size: 16px;
+            z-index: 20;
+            text-shadow: 2px 2px 4px #000;
+            letter-spacing: 1px;
+        }
+
+        .loading-overlay {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: #000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            color: #ffb6c1;
+            z-index: 100;
+            transition: opacity 1s;
+        }
+    </style>
+</head>
+<body>
+
+<div id="loading" class="loading-overlay">正在初始化粒子系统...</div>
+
+<div id="container">
+    <video id="input_video" autoplay playsinline></video>
+    <div class="hint">右：手势 1-4 切换文字，手掌张开释放烟花 | 左：握拳变心/张开扩散</div>
+</div>
+
+<script>
+const CONFIG = {
+    particleCount: 35000,
+    pink: new THREE.Color(0xff69b4),
+    white: new THREE.Color(0xffffff),
+    fontSize: 90,
+    heartScale: 15,
+    fireworkInterval: 500 // 两次烟花之间最小间隔 (ms)
+};
+
+let scene, camera, renderer, particleSystem;
+let targetPositions = []; 
+let currentMode = 'spread'; 
+let activeText = "";
+let lastGesture = "";
+let gestureCount = 0; 
+let lastFireworkTime = 0;
+let fireworks = [];
+
+const shapes = {
+    texts: {
+        '4': 'HELLO 可爱的罗若菲同学',
+        '3': '恭喜你，今天是你的23岁生日',
+        '2': '系统通知：你已被选中成为幸运儿！',
+        '1': 'HAPPY BIRTHDAY TO U ! ! !'
+    },
+    heartPoints: []
+};
+
+// 烟花类定义
+class Firework {
+    constructor(x, y) {
+        const type = Math.floor(Math.random() * 3); // 0: 球形, 1: 星形, 2: 环形
+        const particleCount = 100 + Math.floor(Math.random() * 100);
+        const hue = Math.random() * 360;
+        const color = new THREE.Color(`hsl(${hue}, 100%, 60%)`);
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(particleCount * 3);
+        this.velocities = [];
+
+        for (let i = 0; i < particleCount; i++) {
+            positions[i * 3] = x;
+            positions[i * 3 + 1] = y;
+            positions[i * 3 + 2] = 0;
+
+            let vx, vy, vz;
+            const speed = 2 + Math.random() * 5;
+
+            if (type === 0) { // 球形
+                const phi = Math.acos(-1 + (2 * i) / particleCount);
+                const theta = Math.sqrt(particleCount * Math.PI) * phi;
+                vx = speed * Math.cos(theta) * Math.sin(phi);
+                vy = speed * Math.sin(theta) * Math.sin(phi);
+                vz = speed * Math.cos(phi);
+            } else if (type === 1) { // 星形
+                const angle = (i / particleCount) * Math.PI * 2;
+                const starFactor = (i % 5 === 0) ? 1.5 : 0.5;
+                vx = Math.cos(angle) * speed * starFactor;
+                vy = Math.sin(angle) * speed * starFactor;
+                vz = (Math.random() - 0.5) * 2;
+            } else { // 环形
+                const angle = (i / particleCount) * Math.PI * 2;
+                vx = Math.cos(angle) * speed;
+                vy = Math.sin(angle) * speed;
+                vz = (Math.random() - 0.5) * 0.5;
+            }
+
+            this.velocities.push(new THREE.Vector3(vx, vy, vz));
+        }
+
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        const material = new THREE.PointsMaterial({
+            size: 4,
+            color: color,
+            transparent: true,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false
+        });
+
+        this.points = new THREE.Points(geometry, material);
+        this.life = 1.0;
+        this.decay = 0.015 + Math.random() * 0.01;
+        scene.add(this.points);
+    }
+
+    update() {
+        const positions = this.points.geometry.attributes.position.array;
+        for (let i = 0; i < this.velocities.length; i++) {
+            positions[i * 3] += this.velocities[i].x;
+            positions[i * 3 + 1] += this.velocities[i].y;
+            positions[i * 3 + 2] += this.velocities[i].z;
+            
+            // 重力
+            this.velocities[i].y -= 0.05;
+            // 阻力
+            this.velocities[i].multiplyScalar(0.98);
+        }
+        this.points.geometry.attributes.position.needsUpdate = true;
+        this.life -= this.decay;
+        this.points.material.opacity = this.life;
+
+        if (this.life <= 0) {
+            scene.remove(this.points);
+            return false;
+        }
+        return true;
+    }
+}
+
+function initThree() {
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 2000);
+    camera.position.z = 500;
+
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    document.getElementById('container').appendChild(renderer.domElement);
+    renderer.domElement.id = "canvas_output";
+
+    const geometry = new THREE.BufferGeometry();
+    const positions = new Float32Array(CONFIG.particleCount * 3);
+    const colors = new Float32Array(CONFIG.particleCount * 3);
+    const sizes = new Float32Array(CONFIG.particleCount);
+
+    for (let i = 0; i < CONFIG.particleCount; i++) {
+        positions[i * 3] = (Math.random() - 0.5) * 2000;
+        positions[i * 3 + 1] = (Math.random() - 0.5) * 2000;
+        positions[i * 3 + 2] = (Math.random() - 0.5) * 2000;
+
+        const mixedColor = Math.random() > 0.6 ? CONFIG.pink : CONFIG.white;
+        colors[i * 3] = mixedColor.r;
+        colors[i * 3 + 1] = mixedColor.g;
+        colors[i * 3 + 2] = mixedColor.b;
+        sizes[i] = Math.random() * 2 + 1;
+    }
+
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+
+    const material = new THREE.PointsMaterial({
+        size: 2.5,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.8,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false
+    });
+
+    particleSystem = new THREE.Points(geometry, material);
+    scene.add(particleSystem);
+
+    generateHeartPoints();
+    window.addEventListener('resize', onWindowResize);
+}
+
+function getTextPoints(text) {
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    canvas.width = 2000;
+    canvas.height = 600;
+    
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#fff';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.font = `bold ${CONFIG.fontSize}px "Microsoft YaHei", sans-serif`;
+    
+    ctx.fillText(text, canvas.width / 2, canvas.height / 2);
+
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const points = [];
+    const step = 4; 
+    for (let y = 0; y < canvas.height; y += step) {
+        for (let x = 0; x < canvas.width; x += step) {
+            const index = (y * canvas.width + x) * 4;
+            if (imageData.data[index] > 180) {
+                points.push({
+                    x: (x - canvas.width / 2) * 0.75,
+                    y: (canvas.height / 2 - y) * 0.75,
+                    z: (Math.random() - 0.5) * 10
+                });
+            }
+        }
+    }
+    return points;
+}
+
+function generateHeartPoints() {
+    const points = [];
+    for (let i = 0; i < 6000; i++) {
+        const t = Math.random() * Math.PI * 2;
+        const x = 16 * Math.pow(Math.sin(t), 3);
+        const y = 13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t);
+        points.push({
+            x: x * CONFIG.heartScale,
+            y: y * CONFIG.heartScale,
+            z: (Math.random() - 0.5) * 30
+        });
+    }
+    shapes.heartPoints = points;
+}
+
+function onResults(results) {
+    if (document.getElementById('loading')) {
+        document.getElementById('loading').style.opacity = '0';
+        setTimeout(() => document.getElementById('loading')?.remove(), 1000);
+    }
+
+    if (results.multiHandLandmarks && results.multiHandedness) {
+        results.multiHandLandmarks.forEach((landmarks, index) => {
+            const label = results.multiHandedness[index].label; 
+            const isFingerOpen = [8, 12, 16, 20].map(id => landmarks[id].y < landmarks[id - 2].y);
+            
+            let thumbOpen = false;
+            if (label === "Left") { // 物理右手
+                thumbOpen = landmarks[4].x < landmarks[3].x;
+            } else { // 物理左手
+                thumbOpen = landmarks[4].x > landmarks[3].x;
+            }
+            
+            const openCount = isFingerOpen.filter(v => v).length + (thumbOpen ? 1 : 0);
+            const handX = (0.5 - landmarks[9].x) * window.innerWidth;
+            const handY = (0.5 - landmarks[9].y) * window.innerHeight;
+
+            if (label === "Left") { // 物理右手
+                const currentGesture = openCount.toString();
+                
+                if (currentGesture === lastGesture) {
+                    gestureCount++;
+                } else {
+                    lastGesture = currentGesture;
+                    gestureCount = 0;
+                }
+
+                if (gestureCount > 5) {
+                    if (shapes.texts[currentGesture] && activeText !== shapes.texts[currentGesture]) {
+                        activeText = shapes.texts[currentGesture];
+                        targetPositions = getTextPoints(activeText);
+                        currentMode = 'text';
+                    }
+                }
+
+                // 烟花触发逻辑
+                if (openCount === 5) {
+                    const now = Date.now();
+                    if (now - lastFireworkTime > CONFIG.fireworkInterval) {
+                        fireworks.push(new Firework(handX, handY));
+                        lastFireworkTime = now;
+                    }
+                }
+            } else { // 物理左手
+                const leftHandOpen = openCount > 2;
+                if (!leftHandOpen) {
+                    if (currentMode !== 'heart') {
+                        currentMode = 'heart';
+                        targetPositions = shapes.heartPoints;
+                    }
+                } else if (currentMode === 'heart') {
+                    currentMode = 'spread';
+                }
+            }
+        });
+    }
+}
+
+function animate() {
+    requestAnimationFrame(animate);
+
+    const positions = particleSystem.geometry.attributes.position.array;
+    const time = Date.now() * 0.002;
+    const pulse = 1 + Math.sin(time * 5) * 0.15;
+
+    for (let i = 0; i < CONFIG.particleCount; i++) {
+        let tx, ty, tz;
+        let lerpSpeed = 0.08;
+
+        if (currentMode === 'text' || currentMode === 'heart') {
+            const target = targetPositions[i % targetPositions.length];
+            tx = target.x;
+            ty = target.y;
+            tz = target.z;
+            if (currentMode === 'heart') {
+                tx *= pulse; ty *= pulse; tz *= pulse;
+            }
+        } else {
+            const angle = (i / CONFIG.particleCount) * Math.PI * 2 + time * 0.15;
+            const radius = 400 + Math.sin(time * 0.5 + i * 0.001) * 120;
+            tx = Math.cos(angle) * radius;
+            ty = Math.sin(angle) * radius;
+            tz = Math.sin(time + i) * 60;
+            lerpSpeed = 0.02;
+        }
+
+        positions[i * 3] += (tx - positions[i * 3]) * lerpSpeed;
+        positions[i * 3 + 1] += (ty - positions[i * 3 + 1]) * lerpSpeed;
+        positions[i * 3 + 2] += (tz - positions[i * 3 + 2]) * lerpSpeed;
+    }
+
+    particleSystem.geometry.attributes.position.needsUpdate = true;
+    fireworks = fireworks.filter(fw => fw.update());
+    renderer.render(scene, camera);
+}
+
+function onWindowResize() {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+}
+
+window.onload = () => {
+    initThree();
+    const hands = new Hands({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+    hands.setOptions({
+        maxNumHands: 2,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.8,
+        minTrackingConfidence: 0.8
+    });
+    hands.onResults(onResults);
+    const videoElement = document.getElementById('input_video');
+    const cameraHelper = new Camera(videoElement, {
+        onFrame: async () => { await hands.send({ image: videoElement }); },
+        width: 1280, height: 720
+    });
+    cameraHelper.start();
+    animate();
+};
+</script>
+</body>
+</html>
